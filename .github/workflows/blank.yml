@@ -1,0 +1,205 @@
+
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: "Instance Number (1-10)"
+        required: true
+        default: "1"
+        type: string
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: System Information
+        shell: powershell
+        run: |
+          Write-Host "=== ENIGMANO RDP DEPLOYMENT ===" -ForegroundColor Green
+          Write-Host "Instance: ${{ inputs.instance_number }}" -ForegroundColor Yellow
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+          Write-Host "RDP configuration completed."
+
+      - name: Enable Windows Audio
+        shell: powershell
+        run: |
+          $audio = Get-Service Audiosrv -ErrorAction SilentlyContinue
+          if ($null -ne $audio) {
+            Set-Service Audiosrv -StartupType Automatic
+            Start-Service Audiosrv -ErrorAction SilentlyContinue
+          }
+
+      - name: Check Microsoft Store
+        shell: powershell
+        run: |
+          $store = Get-AppxPackage -AllUsers `
+            -Name Microsoft.WindowsStore `
+            -ErrorAction SilentlyContinue
+          if ($store) {
+            Write-Host "Microsoft Store is installed."
+          } else {
+            Write-Host "Microsoft Store is unavailable on this runner."
+          }
+
+      - name: Validate Credentials
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Configure TAILSCALE_AUTH_KEY in GitHub Secrets."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Configure RDP_PASSWORD in GitHub Secrets."
+          }
+          Write-Host "Required secrets are present."
+
+      - name: Create Rafael User Account
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name Rafael -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+            New-LocalUser -Name Rafael `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -PasswordNeverExpires
+          } else {
+            Set-LocalUser -Name Rafael -Password $securePassword
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" `
+            -Member Rafael -ErrorAction SilentlyContinue
+          Write-Host "Rafael account configured."
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $proc = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait -PassThru
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          if ($proc.ExitCode -ne 0) {
+            throw "Tailscale installation failed: $($proc.ExitCode)"
+          }
+
+      - name: Start Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale executable not found."
+          }
+
+          & $tailscale up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=enigmano-${{ github.run_id }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale authentication failed. Check or replace the Auth Key."
+          }
+
+          Start-Sleep -Seconds 5
+          & $tailscale status
+
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          $ip = & $tailscale ip -4
+          if ($LASTEXITCODE -ne 0 -or
+              [string]::IsNullOrWhiteSpace(($ip | Select-Object -First 1))) {
+            throw "Could not obtain Tailscale IP."
+          }
+          $ip = ($ip | Select-Object -First 1).Trim()
+          Write-Host "Tailscale IP: $ip"
+          "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Google Chrome
+        shell: powershell
+        run: |
+          $url = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+          $installer = Join-Path $env:TEMP "chrome_installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $proc = Start-Process $installer `
+            -ArgumentList "/silent /install" -Wait -PassThru
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          if ($proc.ExitCode -ne 0) {
+            Write-Warning "Chrome installer returned exit code $($proc.ExitCode)."
+          }
+
+      - name: Install 7-Zip
+        shell: powershell
+        run: |
+          $url = "https://www.7-zip.org/a/7z2409-x64.exe"
+          $installer = Join-Path $env:TEMP "7zip-installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $proc = Start-Process $installer `
+            -ArgumentList "/S" -Wait -PassThru
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          if ($proc.ExitCode -ne 0) {
+            Write-Warning "7-Zip installer returned exit code $($proc.ExitCode)."
+          }
+
+      - name: Connection Details
+        shell: powershell
+        run: |
+          Write-Host "=== CONNECTION INFORMATION ===" -ForegroundColor Green
+          Write-Host "Host: $env:TAILSCALE_IP"
+          Write-Host "Username: Rafael"
+          Write-Host "Audio: Check client redirection settings"
+          Write-Host "Use your separately configured RDP_PASSWORD."
+          Write-Host "Keep this runner within your organization's authorized access."
+
+      - name: Keep Session Alive
+        shell: powershell
+        run: |
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          $counter = 0
+
+          while ($true) {
+            $counter++
+            Write-Host "Heartbeat #$counter - $(Get-Date)"
+            $audio = Get-Service Audiosrv -ErrorAction SilentlyContinue
+
+            if ($null -ne $audio -and $audio.Status -ne "Running") {
+              Start-Service Audiosrv -ErrorAction SilentlyContinue
+            }
+
+            & $tailscale status | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Tailscale connection is unavailable."
+            }
+
+            Start-Sleep -Seconds 60
+          }
+          
